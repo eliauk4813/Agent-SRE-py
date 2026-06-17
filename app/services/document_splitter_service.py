@@ -1,176 +1,361 @@
-"""文档分割服务模块 - 基于 LangChain 的智能文档分割"""
+"""Markdown document splitting service."""
 
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from langchain_core.documents import Document
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 from loguru import logger
 
 from app.config import config
 
 
+HEADER_KEYS = ("h1", "h2", "h3")
+CODE_FENCE_RE = re.compile(r"^```")
+ORDERED_LIST_RE = re.compile(r"^\s*\d+\.\s+")
+UNORDERED_LIST_RE = re.compile(r"^\s*[-*+]\s+")
+QUOTE_RE = re.compile(r"^\s*>")
+TABLE_RE = re.compile(r"^\s*\|.*\|\s*$")
+TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:-]+(?:\|[\s:-]+)+\|?\s*$")
+
+
+@dataclass
+class MarkdownBlock:
+    """A semantic Markdown block within a section."""
+
+    block_type: str
+    content: str
+
+
 class DocumentSplitterService:
-    """文档分割服务 - 使用 LangChain 的分割器"""
+    """Split Markdown documents into retrieval-friendly chunks."""
 
-    def __init__(self):
-        """初始化文档分割服务"""
-        self.chunk_size = config.chunk_max_size
-        self.chunk_overlap = config.chunk_overlap
+    def __init__(self) -> None:
+        self.target_chunk_size = config.md_chunk_target_size
+        self.max_chunk_size = config.md_chunk_max_size
+        self.chunk_overlap = config.md_chunk_overlap
+        self.min_chunk_size = config.md_chunk_min_size
 
-        # Markdown 标题分割器 (只按一级和二级标题分割，减少分片数)
         self.markdown_splitter = MarkdownHeaderTextSplitter(
             headers_to_split_on=[
                 ("#", "h1"),
                 ("##", "h2"),
-                # 不再按三级标题分割，避免过度碎片化
+                ("###", "h3"),
             ],
-            strip_headers=False,  # 保留标题在内容中
+            strip_headers=False,
         )
-
-        # 递归字符分割器 (用于二次分割，使用更大的chunk_size)
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size * 2,  # 加倍chunk_size，减少分片数
+        self.fallback_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.max_chunk_size,
             chunk_overlap=self.chunk_overlap,
+            separators=["\n\n", "\n", "。", "；", "，", " ", ""],
             length_function=len,
             is_separator_regex=False,
         )
 
         logger.info(
-            f"文档分割服务初始化完成, chunk_size={self.chunk_size}, "
-            f"secondary_chunk_size={self.chunk_size * 2}, "
-            f"overlap={self.chunk_overlap}"
+            "Document splitter initialized for Markdown: "
+            f"target={self.target_chunk_size}, max={self.max_chunk_size}, "
+            f"overlap={self.chunk_overlap}, min={self.min_chunk_size}"
         )
 
-    def split_markdown(self, content: str, file_path: str = "") -> List[Document]:
-        """
-        分割 Markdown 文档 (两阶段分割 + 合并小片段)
-
-        Args:
-            content: Markdown 内容
-            file_path: 文件路径 (用于元数据)
-
-        Returns:
-            List[Document]: 文档分片列表
-        """
-        if not content or not content.strip():
-            logger.warning(f"Markdown 文档内容为空: {file_path}")
-            return []
-
-        try:
-            # 第一阶段: 按标题分割
-            md_docs = self.markdown_splitter.split_text(content)
-
-            # 第二阶段: 按大小进一步分割
-            docs_after_split = self.text_splitter.split_documents(md_docs)
-
-            # 第三阶段: 合并太小的分片 (< 300字符)
-            final_docs = self._merge_small_chunks(docs_after_split, min_size=300)
-
-            # 添加文件路径元数据
-            for doc in final_docs:
-                doc.metadata["_source"] = file_path
-                doc.metadata["_extension"] = ".md"
-                doc.metadata["_file_name"] = Path(file_path).name
-
-            logger.info(f"Markdown 分割完成: {file_path} -> {len(final_docs)} 个分片")
-            return final_docs
-
-        except Exception as e:
-            logger.error(f"Markdown 分割失败: {file_path}, 错误: {e}")
-            raise
-
-    def split_text(self, content: str, file_path: str = "") -> List[Document]:
-        """
-        分割普通文本文档
-
-        Args:
-            content: 文本内容
-            file_path: 文件路径 (用于元数据)
-
-        Returns:
-            List[Document]: 文档分片列表
-        """
-        if not content or not content.strip():
-            logger.warning(f"文本文档内容为空: {file_path}")
-            return []
-
-        try:
-            # 直接使用递归字符分割器
-            docs = self.text_splitter.create_documents(
-                texts=[content],
-                metadatas=[
-                    {
-                        "_source": file_path,
-                        "_extension": Path(file_path).suffix,
-                        "_file_name": Path(file_path).name,
-                    }
-                ],
-            )
-
-            logger.info(f"文本分割完成: {file_path} -> {len(docs)} 个分片")
-            return docs
-
-        except Exception as e:
-            logger.error(f"文本分割失败: {file_path}, 错误: {e}")
-            raise
-
     def split_document(self, content: str, file_path: str = "") -> List[Document]:
-        """
-        智能分割文档 (根据文件类型选择分割器)
+        """Split a Markdown document into chunks."""
+        if file_path and not file_path.endswith(".md"):
+            raise ValueError(f"Only Markdown files are supported: {file_path}")
+        return self.split_markdown(content, file_path)
 
-        Args:
-            content: 文档内容
-            file_path: 文件路径
-
-        Returns:
-            List[Document]: 文档分片列表
-        """
-        if file_path.endswith(".md"):
-            return self.split_markdown(content, file_path)
-        else:
-            return self.split_text(content, file_path)
-
-    def _merge_small_chunks(
-        self, documents: List[Document], min_size: int = 300
-    ) -> List[Document]:
-        """
-        合并太小的分片
-
-        Args:
-            documents: 文档列表
-            min_size: 最小分片大小 (字符数)
-
-        Returns:
-            List[Document]: 合并后的文档列表
-        """
-        if not documents:
+    def split_markdown(self, content: str, file_path: str = "") -> List[Document]:
+        """Split Markdown content by structure first, length second."""
+        normalized = self._normalize_content(content)
+        if not normalized:
+            logger.warning(f"Markdown content is empty: {file_path}")
             return []
 
-        merged_docs = []
-        current_doc = None
+        source_path = file_path
+        file_name = Path(file_path).name if file_path else ""
+        final_docs: List[Document] = []
 
-        for doc in documents:
-            doc_size = len(doc.page_content)
+        try:
+            sections = self.markdown_splitter.split_text(normalized)
+            for section_index, section_doc in enumerate(sections):
+                blocks = self._split_markdown_section_blocks(section_doc)
+                assembled_docs = self._assemble_blocks_to_chunks(
+                    blocks=blocks,
+                    section_doc=section_doc,
+                    source_path=source_path,
+                    file_name=file_name,
+                    section_index=section_index,
+                )
+                final_docs.extend(assembled_docs)
 
-            if current_doc is None:
-                # 第一个文档
-                current_doc = doc
-            elif doc_size < min_size and len(current_doc.page_content) < self.chunk_size * 2:
-                # 当前文档太小且合并后不会太大，则合并
-                current_doc.page_content += "\n\n" + doc.page_content
-                # 保留主文档的元数据
-            else:
-                # 保存当前文档，开始新文档
-                merged_docs.append(current_doc)
-                current_doc = doc
+            for chunk_index, doc in enumerate(final_docs):
+                doc.metadata["chunk_index"] = chunk_index
 
-        # 添加最后一个文档
-        if current_doc is not None:
-            merged_docs.append(current_doc)
+            logger.info(
+                f"Markdown split complete: {file_path or '<memory>'} -> {len(final_docs)} chunks"
+            )
+            return final_docs
+        except Exception as exc:
+            logger.error(f"Markdown split failed: {file_path}, error: {exc}")
+            raise
 
-        return merged_docs
+    def _normalize_content(self, content: str) -> str:
+        """Normalize line endings and trim outer whitespace."""
+        if not content or not content.strip():
+            return ""
+        return content.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def _split_markdown_section_blocks(self, section_doc: Document) -> List[MarkdownBlock]:
+        """Split a section into semantic Markdown blocks."""
+        lines = section_doc.page_content.split("\n")
+        blocks: List[MarkdownBlock] = []
+        index = 0
+
+        while index < len(lines):
+            line = lines[index]
+
+            if not line.strip():
+                index += 1
+                continue
+
+            if CODE_FENCE_RE.match(line.strip()):
+                block_lines = [line]
+                index += 1
+                while index < len(lines):
+                    block_lines.append(lines[index])
+                    if CODE_FENCE_RE.match(lines[index].strip()):
+                        index += 1
+                        break
+                    index += 1
+                blocks.append(MarkdownBlock("code", "\n".join(block_lines).strip()))
+                continue
+
+            if self._is_table_start(lines, index):
+                block_lines = [line]
+                index += 1
+                while index < len(lines) and TABLE_RE.match(lines[index]):
+                    block_lines.append(lines[index])
+                    index += 1
+                blocks.append(MarkdownBlock("table", "\n".join(block_lines).strip()))
+                continue
+
+            if self._is_list_line(line):
+                block_lines = [line]
+                index += 1
+                while index < len(lines):
+                    next_line = lines[index]
+                    if not next_line.strip():
+                        lookahead = index + 1
+                        if lookahead < len(lines) and self._is_list_line(lines[lookahead]):
+                            block_lines.append(next_line)
+                            index += 1
+                            continue
+                        break
+                    if self._is_list_line(next_line) or next_line.startswith("  ") or next_line.startswith("\t"):
+                        block_lines.append(next_line)
+                        index += 1
+                        continue
+                    break
+                blocks.append(MarkdownBlock("list", "\n".join(block_lines).strip()))
+                continue
+
+            if QUOTE_RE.match(line):
+                block_lines = [line]
+                index += 1
+                while index < len(lines) and lines[index].strip():
+                    if not QUOTE_RE.match(lines[index]):
+                        break
+                    block_lines.append(lines[index])
+                    index += 1
+                blocks.append(MarkdownBlock("quote", "\n".join(block_lines).strip()))
+                continue
+
+            block_lines = [line]
+            index += 1
+            while index < len(lines):
+                next_line = lines[index]
+                if not next_line.strip():
+                    break
+                if (
+                    CODE_FENCE_RE.match(next_line.strip())
+                    or self._is_table_start(lines, index)
+                    or self._is_list_line(next_line)
+                    or QUOTE_RE.match(next_line)
+                ):
+                    break
+                block_lines.append(next_line)
+                index += 1
+            blocks.append(MarkdownBlock("paragraph", "\n".join(block_lines).strip()))
+
+        return blocks
+
+    def _assemble_blocks_to_chunks(
+        self,
+        blocks: List[MarkdownBlock],
+        section_doc: Document,
+        source_path: str,
+        file_name: str,
+        section_index: int,
+    ) -> List[Document]:
+        """Assemble semantic blocks into final chunks."""
+        docs: List[Document] = []
+        current_blocks: List[MarkdownBlock] = []
+
+        for block in blocks:
+            if self._should_split_block(block):
+                docs.extend(
+                    self._flush_current_blocks(
+                        current_blocks, section_doc.metadata, source_path, file_name, section_index
+                    )
+                )
+                current_blocks = []
+                docs.extend(
+                    self._split_oversized_block(
+                        block, section_doc.metadata, source_path, file_name, section_index
+                    )
+                )
+                continue
+
+            candidate_blocks = current_blocks + [block]
+            candidate_size = self._blocks_size(candidate_blocks)
+
+            if candidate_size <= self.target_chunk_size:
+                current_blocks = candidate_blocks
+                continue
+
+            if current_blocks and self._blocks_size(current_blocks) >= self.min_chunk_size:
+                docs.extend(
+                    self._flush_current_blocks(
+                        current_blocks, section_doc.metadata, source_path, file_name, section_index
+                    )
+                )
+                current_blocks = [block]
+                continue
+
+            current_blocks = candidate_blocks
+            if candidate_size > self.max_chunk_size:
+                docs.extend(
+                    self._flush_current_blocks(
+                        current_blocks, section_doc.metadata, source_path, file_name, section_index
+                    )
+                )
+                current_blocks = []
+
+        docs.extend(
+            self._flush_current_blocks(
+                current_blocks, section_doc.metadata, source_path, file_name, section_index
+            )
+        )
+        return docs
+
+    def _flush_current_blocks(
+        self,
+        blocks: List[MarkdownBlock],
+        metadata: Dict[str, Any],
+        source_path: str,
+        file_name: str,
+        section_index: int,
+    ) -> List[Document]:
+        """Emit a chunk from accumulated blocks."""
+        if not blocks:
+            return []
+
+        content = "\n\n".join(block.content for block in blocks if block.content.strip()).strip()
+        if not content:
+            return []
+
+        doc_metadata = self._build_chunk_metadata(
+            metadata=metadata,
+            source_path=source_path,
+            file_name=file_name,
+            section_index=section_index,
+            block_types=sorted({block.block_type for block in blocks}),
+        )
+        return [Document(page_content=content, metadata=doc_metadata)]
+
+    def _split_oversized_block(
+        self,
+        block: MarkdownBlock,
+        metadata: Dict[str, Any],
+        source_path: str,
+        file_name: str,
+        section_index: int,
+    ) -> List[Document]:
+        """Split an oversized block with a recursive fallback splitter."""
+        fallback_docs = self.fallback_splitter.create_documents([block.content])
+        split_docs: List[Document] = []
+        for doc in fallback_docs:
+            split_docs.append(
+                Document(
+                    page_content=doc.page_content.strip(),
+                    metadata=self._build_chunk_metadata(
+                        metadata=metadata,
+                        source_path=source_path,
+                        file_name=file_name,
+                        section_index=section_index,
+                        block_types=[block.block_type],
+                    ),
+                )
+            )
+        return [doc for doc in split_docs if doc.page_content]
+
+    def _build_chunk_metadata(
+        self,
+        metadata: Dict[str, Any],
+        source_path: str,
+        file_name: str,
+        section_index: int,
+        block_types: List[str],
+    ) -> Dict[str, Any]:
+        """Build metadata for the final chunk."""
+        chunk_metadata: Dict[str, Any] = {
+            "_source": source_path,
+            "_extension": ".md",
+            "_file_name": file_name,
+            "section_index": section_index,
+            "block_types": block_types,
+        }
+        for key in HEADER_KEYS:
+            value = metadata.get(key)
+            if value:
+                chunk_metadata[key] = value
+        chunk_metadata["header_path"] = self._build_header_path(chunk_metadata)
+        return chunk_metadata
+
+    def _build_header_path(self, metadata: Dict[str, Any]) -> str:
+        """Build a hierarchical header path from metadata."""
+        parts = [metadata[key].strip() for key in HEADER_KEYS if metadata.get(key)]
+        return " > ".join(parts)
+
+    def _blocks_size(self, blocks: List[MarkdownBlock]) -> int:
+        """Calculate the assembled size of blocks."""
+        if not blocks:
+            return 0
+        return len("\n\n".join(block.content for block in blocks))
+
+    def _should_split_block(self, block: MarkdownBlock) -> bool:
+        """Decide whether a block needs fallback splitting."""
+        block_size = len(block.content)
+        if block.block_type in {"code", "table"}:
+            return block_size > int(self.max_chunk_size * 1.5)
+        return block_size > self.max_chunk_size
+
+    def _is_table_start(self, lines: List[str], index: int) -> bool:
+        """Detect whether the current line begins a Markdown table."""
+        if index + 1 >= len(lines):
+            return False
+        return bool(TABLE_RE.match(lines[index]) and TABLE_SEPARATOR_RE.match(lines[index + 1]))
+
+    def _is_list_line(self, line: str) -> bool:
+        """Detect unordered or ordered Markdown list lines."""
+        return bool(ORDERED_LIST_RE.match(line) or UNORDERED_LIST_RE.match(line))
 
 
-# 全局单例
 document_splitter_service = DocumentSplitterService()
