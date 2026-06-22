@@ -1,19 +1,24 @@
-"""Vector indexing service."""
+"""Hybrid document indexing service."""
 
+from __future__ import annotations
+
+import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from langchain_core.documents import Document
 from loguru import logger
 
 from app.services.document_splitter_service import document_splitter_service
+from app.services.keyword_index_service import keyword_index_service
 from app.services.vector_store_manager import vector_store_manager
 
 
 class IndexingResult:
     """Indexing result data."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.success = False
         self.directory_path = ""
         self.total_files = 0
@@ -24,13 +29,13 @@ class IndexingResult:
         self.error_message = ""
         self.failed_files: Dict[str, str] = {}
 
-    def increment_success_count(self):
+    def increment_success_count(self) -> None:
         self.success_count += 1
 
-    def increment_fail_count(self):
+    def increment_fail_count(self) -> None:
         self.fail_count += 1
 
-    def add_failed_file(self, file_path: str, error: str):
+    def add_failed_file(self, file_path: str, error: str) -> None:
         self.failed_files[file_path] = error
 
     def get_duration_ms(self) -> int:
@@ -52,11 +57,11 @@ class IndexingResult:
 
 
 class VectorIndexService:
-    """Read Markdown files, split them and store vectors in Milvus."""
+    """Read Markdown files, split them, and index chunks into Milvus and ES."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.upload_path = "./uploads"
-        logger.info("Vector index service initialized")
+        logger.info("Hybrid index service initialized")
 
     def index_directory(self, directory_path: Optional[str] = None) -> IndexingResult:
         """Index all Markdown files within a directory."""
@@ -107,15 +112,15 @@ class VectorIndexService:
             result.end_time = datetime.now()
             return result
 
-    def index_single_file(self, file_path: str):
-        """Index a single Markdown file."""
+    def index_single_file(self, file_path: str) -> None:
+        """Index a single Markdown file into both Milvus and Elasticsearch."""
         path = Path(file_path).resolve()
         if not path.exists() or not path.is_file():
             raise ValueError(f"File does not exist: {file_path}")
         if path.suffix.lower() != ".md":
             raise ValueError(f"Only Markdown files are supported: {file_path}")
 
-        logger.info(f"Start indexing file: {path}")
+        logger.info(f"Start hybrid indexing file: {path}")
 
         try:
             content = path.read_text(encoding="utf-8")
@@ -123,18 +128,32 @@ class VectorIndexService:
 
             normalized_path = path.as_posix()
             vector_store_manager.delete_by_source(normalized_path)
+            keyword_index_service.delete_by_source(normalized_path)
 
             documents = document_splitter_service.split_document(content, normalized_path)
+            self._assign_chunk_ids(documents, normalized_path)
             logger.info(f"Split complete: {file_path} -> {len(documents)} chunks")
 
             if documents:
-                vector_store_manager.add_documents(documents)
-                logger.info(f"Indexed file complete: {file_path}, chunks={len(documents)}")
+                chunk_ids = [str(doc.metadata["chunk_id"]) for doc in documents]
+                vector_store_manager.add_documents(documents, ids=chunk_ids)
+                keyword_index_service.add_documents(documents)
+                logger.info(
+                    f"Hybrid index complete: {file_path}, chunks={len(documents)}, "
+                    "targets=Milvus+Elasticsearch"
+                )
             else:
                 logger.warning(f"Markdown content is empty or produced no chunks: {file_path}")
         except Exception as exc:
             logger.error(f"Failed to index file: {file_path}, error: {exc}")
             raise RuntimeError(f"Failed to index file: {exc}") from exc
+
+    def _assign_chunk_ids(self, documents: List[Document], source_path: str) -> None:
+        """Assign stable ids shared by Milvus and ES for RRF de-duplication."""
+        for doc in documents:
+            chunk_index = doc.metadata.get("chunk_index", 0)
+            digest_source = f"{source_path}:{chunk_index}:{doc.page_content}"
+            doc.metadata["chunk_id"] = hashlib.sha1(digest_source.encode("utf-8")).hexdigest()
 
 
 vector_index_service = VectorIndexService()
