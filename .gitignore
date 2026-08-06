@@ -78,3 +78,9 @@ dmypy.json
 # Ruff
 .ruff_cache/
 
+# Tests and Docs (不推送测试和文档)
+tests/
+docs/
+项目文件说明.md
+TECHNICAL_REVIEW.md
+

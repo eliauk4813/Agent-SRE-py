@@ -27,10 +27,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "langchain-milvus>=0.3.3",
     "langchain-text-splitters>=1.1.0",
+    "langchain-experimental>=0.0.47",
     "langchain-mcp-adapters>=0.2.1",
     "fastmcp>=2.14.0",
     "langchain-qwq>=0.3.4",
     "elasticsearch>=8.13.0",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 from langchain_text_splitters import (
@@ -15,6 +15,9 @@ from langchain_text_splitters import (
 from loguru import logger
 
 from app.config import config
+
+# 延迟导入语义切分器（避免循环依赖）
+_semantic_chunker = None
 
 
 HEADER_KEYS = ("h1", "h2", "h3")
@@ -35,14 +38,28 @@ class MarkdownBlock:
 
 
 class DocumentSplitterService:
-    """Split Markdown documents into retrieval-friendly chunks."""
+    """Split Markdown documents into retrieval-friendly chunks.
 
-    def __init__(self) -> None:
+    支持两种切分模式：
+    1. 传统模式（legacy）：基于标题+固定大小切分
+    2. 语义模式（semantic）：基于embedding相似度的语义边界切分
+    """
+
+    def __init__(self, use_semantic_chunking: bool = True) -> None:
+        """初始化文档切分服务
+
+        Args:
+            use_semantic_chunking: 是否使用语义切分（默认开启）
+                - True: 使用语义边界感知切分（推荐，针对运维文档优化）
+                - False: 使用传统固定大小切分（向后兼容）
+        """
         self.target_chunk_size = config.md_chunk_target_size
         self.max_chunk_size = config.md_chunk_max_size
         self.chunk_overlap = config.md_chunk_overlap
         self.min_chunk_size = config.md_chunk_min_size
+        self.use_semantic_chunking = use_semantic_chunking
 
+        # 标题切分器（用于提取标题信息）
         self.markdown_splitter = MarkdownHeaderTextSplitter(
             headers_to_split_on=[
                 ("#", "h1"),
@@ -51,6 +68,8 @@ class DocumentSplitterService:
             ],
             strip_headers=False,
         )
+
+        # 传统切分器（降级方案）
         self.fallback_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.max_chunk_size,
             chunk_overlap=self.chunk_overlap,
@@ -60,7 +79,8 @@ class DocumentSplitterService:
         )
 
         logger.info(
-            "Document splitter initialized for Markdown: "
+            f"Document splitter initialized: "
+            f"mode={'semantic' if use_semantic_chunking else 'legacy'}, "
             f"target={self.target_chunk_size}, max={self.max_chunk_size}, "
             f"overlap={self.chunk_overlap}, min={self.min_chunk_size}"
         )
@@ -72,7 +92,12 @@ class DocumentSplitterService:
         return self.split_markdown(content, file_path)
 
     def split_markdown(self, content: str, file_path: str = "") -> List[Document]:
-        """Split Markdown content by structure first, length second."""
+        """Split Markdown content by structure first, length second.
+
+        根据配置选择切分策略：
+        - semantic模式：使用语义边界感知切分（推荐）
+        - legacy模式：使用传统标题+固定大小切分
+        """
         normalized = self._normalize_content(content)
         if not normalized:
             logger.warning(f"Markdown content is empty: {file_path}")
@@ -80,10 +105,120 @@ class DocumentSplitterService:
 
         source_path = file_path
         file_name = Path(file_path).name if file_path else ""
+
+        # 使用语义切分（新方案）
+        if self.use_semantic_chunking:
+            try:
+                return self._split_markdown_semantic(
+                    content=normalized,
+                    source_path=source_path,
+                    file_name=file_name
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Semantic chunking failed for {file_path}: {exc}, "
+                    f"fallback to legacy mode"
+                )
+                # 降级到传统模式
+                return self._split_markdown_legacy(
+                    content=normalized,
+                    source_path=source_path,
+                    file_name=file_name
+                )
+        else:
+            # 传统切分（向后兼容）
+            return self._split_markdown_legacy(
+                content=normalized,
+                source_path=source_path,
+                file_name=file_name
+            )
+
+    def _split_markdown_semantic(
+        self,
+        content: str,
+        source_path: str,
+        file_name: str
+    ) -> List[Document]:
+        """语义切分模式（新方案）
+
+        流程：
+        1. 使用 MarkdownHeaderTextSplitter 提取标题信息
+        2. 对每个 section 使用语义边界感知切分
+        3. 注入层级 context
+        """
+        global _semantic_chunker
+
+        # 延迟初始化语义切分器
+        if _semantic_chunker is None:
+            from app.services.semantic_chunker import OperationalSemanticChunker
+            from app.services.vector_embedding_service import embedding_service
+
+            _semantic_chunker = OperationalSemanticChunker(
+                embeddings=embedding_service.get_embeddings(),
+                breakpoint_threshold_type="percentile",
+                breakpoint_threshold_amount=85  # 85分位数，平衡chunk大小
+            )
+            logger.info("Semantic chunker initialized")
+
         final_docs: List[Document] = []
 
         try:
-            sections = self.markdown_splitter.split_text(normalized)
+            # 1. 按标题分段（保留标题信息）
+            sections = self.markdown_splitter.split_text(content)
+            logger.info(f"Extracted {len(sections)} sections from {source_path}")
+
+            # 2. 对每个 section 进行语义切分
+            for section_index, section_doc in enumerate(sections):
+                # 构建 metadata
+                metadata = {
+                    "_source": source_path,
+                    "_file_name": file_name,
+                    "_extension": ".md",
+                    "section_index": section_index,
+                }
+
+                # 继承标题信息
+                for key in ["h1", "h2", "h3"]:
+                    if section_doc.metadata.get(key):
+                        metadata[key] = section_doc.metadata[key]
+
+                # 调用语义切分器
+                section_chunks = _semantic_chunker.split_with_context(
+                    content=section_doc.page_content,
+                    metadata=metadata,
+                    source_path=source_path
+                )
+
+                final_docs.extend(section_chunks)
+
+            # 3. 重新编号
+            for chunk_index, doc in enumerate(final_docs):
+                doc.metadata["chunk_index"] = chunk_index
+
+            logger.info(
+                f"Semantic split complete: {source_path or '<memory>'} -> "
+                f"{len(final_docs)} chunks (from {len(sections)} sections)"
+            )
+            return final_docs
+
+        except Exception as exc:
+            logger.error(f"Semantic markdown split failed: {source_path}, error: {exc}")
+            raise
+
+    def _split_markdown_legacy(
+        self,
+        content: str,
+        source_path: str,
+        file_name: str
+    ) -> List[Document]:
+        """传统切分模式（向后兼容）
+
+        原有逻辑：按标题分段 -> 按语义块分段 -> 按目标大小组装
+        """
+        final_docs: List[Document] = []
+
+        try:
+            sections = self.markdown_splitter.split_text(content)
             for section_index, section_doc in enumerate(sections):
                 blocks = self._split_markdown_section_blocks(section_doc)
                 assembled_docs = self._assemble_blocks_to_chunks(
@@ -99,11 +234,12 @@ class DocumentSplitterService:
                 doc.metadata["chunk_index"] = chunk_index
 
             logger.info(
-                f"Markdown split complete: {file_path or '<memory>'} -> {len(final_docs)} chunks"
+                f"Legacy split complete: {source_path or '<memory>'} -> "
+                f"{len(final_docs)} chunks"
             )
             return final_docs
         except Exception as exc:
-            logger.error(f"Markdown split failed: {file_path}, error: {exc}")
+            logger.error(f"Legacy markdown split failed: {source_path}, error: {exc}")
             raise
 
     def _normalize_content(self, content: str) -> str:
@@ -358,4 +494,7 @@ class DocumentSplitterService:
         return bool(ORDERED_LIST_RE.match(line) or UNORDERED_LIST_RE.match(line))
 
 
-document_splitter_service = DocumentSplitterService()
+# 全局单例：根据配置选择切分模式
+document_splitter_service = DocumentSplitterService(
+    use_semantic_chunking=config.md_use_semantic_chunking
+)
