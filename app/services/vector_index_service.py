@@ -11,6 +11,7 @@ from langchain_core.documents import Document
 from loguru import logger
 
 from app.services.document_splitter_service import document_splitter_service
+from app.services.document_quality_checker import document_quality_checker
 from app.services.keyword_index_service import keyword_index_service
 from app.services.vector_store_manager import vector_store_manager
 
@@ -113,7 +114,15 @@ class VectorIndexService:
             return result
 
     def index_single_file(self, file_path: str) -> None:
-        """Index a single Markdown file into both Milvus and Elasticsearch."""
+        """Index a single Markdown file into both Milvus and Elasticsearch.
+
+        改进后的流程：
+        1. 读取文件内容
+        2. 文档切分
+        3. 🆕 质量检查与清洗（新增）
+        4. 生成chunk_id
+        5. 索引到 Milvus + Elasticsearch
+        """
         path = Path(file_path).resolve()
         if not path.exists() or not path.is_file():
             raise ValueError(f"File does not exist: {file_path}")
@@ -130,20 +139,58 @@ class VectorIndexService:
             vector_store_manager.delete_by_source(normalized_path)
             keyword_index_service.delete_by_source(normalized_path)
 
+            # 步骤1: 文档切分
             documents = document_splitter_service.split_document(content, normalized_path)
-            self._assign_chunk_ids(documents, normalized_path)
             logger.info(f"Split complete: {file_path} -> {len(documents)} chunks")
 
-            if documents:
-                chunk_ids = [str(doc.metadata["chunk_id"]) for doc in documents]
-                vector_store_manager.add_documents(documents, ids=chunk_ids)
-                keyword_index_service.add_documents(documents)
-                logger.info(
-                    f"Hybrid index complete: {file_path}, chunks={len(documents)}, "
-                    "targets=Milvus+Elasticsearch"
-                )
-            else:
+            if not documents:
                 logger.warning(f"Markdown content is empty or produced no chunks: {file_path}")
+                return
+
+            # 步骤2: 🆕 质量检查与清洗
+            cleaned_documents, quality_report = document_quality_checker.check_and_clean(
+                documents=documents,
+                source_path=normalized_path
+            )
+
+            # 记录质量报告
+            logger.info(
+                f"Quality check result: {file_path}, "
+                f"input={quality_report.total_input}, "
+                f"valid={quality_report.total_valid}, "
+                f"filtered={quality_report.total_filtered}, "
+                f"score={quality_report.quality_score:.1f}/100"
+            )
+
+            # 如果有严重问题，记录详情
+            if quality_report.critical_count > 0:
+                logger.warning(
+                    f"Found {quality_report.critical_count} critical issues in {file_path}"
+                )
+
+            # 如果所有chunk都被过滤，记录警告
+            if not cleaned_documents:
+                logger.warning(
+                    f"All chunks filtered due to quality issues: {file_path}, "
+                    f"report={quality_report.to_dict()}"
+                )
+                return
+
+            # 步骤3: 生成chunk_id（只为有效chunk生成）
+            self._assign_chunk_ids(cleaned_documents, normalized_path)
+
+            # 步骤4: 索引（只索引通过质量检查的chunk）
+            chunk_ids = [str(doc.metadata["chunk_id"]) for doc in cleaned_documents]
+            vector_store_manager.add_documents(cleaned_documents, ids=chunk_ids)
+            keyword_index_service.add_documents(cleaned_documents)
+
+            logger.info(
+                f"Hybrid index complete: {file_path}, "
+                f"indexed={len(cleaned_documents)}/{len(documents)} chunks, "
+                f"quality_score={quality_report.quality_score:.1f}, "
+                f"targets=Milvus+Elasticsearch"
+            )
+
         except Exception as exc:
             logger.error(f"Failed to index file: {file_path}, error: {exc}")
             raise RuntimeError(f"Failed to index file: {exc}") from exc
