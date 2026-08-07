@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     milvus_host: str = "localhost"
     milvus_port: int = 19530
     milvus_timeout: int = 10000
+    milvus_index_type: str = "auto"  # auto, FLAT, IVF_FLAT, HNSW, IVF_PQ
+    milvus_metric_type: str = "L2"  # L2, IP, COSINE
 
     rag_top_k: int = 3
     rag_final_top_k: int = 5

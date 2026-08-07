@@ -13,6 +13,7 @@ from pymilvus import (
 )
 
 from app.config import config
+from app.services.index_strategy_selector import index_strategy_selector
 
 
 def _patch_pymilvus_milvus_client_orm_alias() -> None:
@@ -190,22 +191,63 @@ class MilvusClientManager:
         self._create_index()
 
     def _create_index(self) -> None:
-        """为 vector 字段创建索引"""
+        """为 vector 字段创建自适应索引"""
         if self._collection is None:
             raise RuntimeError("Collection 未初始化")
 
-        index_params = {
-            "metric_type": "L2",  # 欧氏距离
-            "index_type": "IVF_FLAT",
-            "params": {"nlist": 128},
-        }
+        # 获取当前collection中的向量数量
+        try:
+            vector_count = self._collection.num_entities
+        except Exception:
+            # 如果无法获取数量，假设为0（新collection）
+            vector_count = 0
 
-        _ = self._collection.create_index(
-            field_name="vector",
-            index_params=index_params,
+        logger.info(f"当前向量数量: {vector_count:,}")
+
+        # 使用策略选择器推荐索引
+        recommendation = index_strategy_selector.select_index(
+            vector_count=max(vector_count, 1000),  # 最少按1000估算
+            preferred_index_type=config.milvus_index_type,
+            metric_type=config.milvus_metric_type,  # type: ignore[arg-type]
         )
 
-        logger.info("成功为 vector 字段创建索引")
+        logger.info(
+            f"索引推荐: {recommendation.index_type} "
+            f"(召回率: {recommendation.expected_recall:.1%}, "
+            f"预估查询: {recommendation.estimated_query_time_ms:.2f}ms, "
+            f"预估内存: {recommendation.estimated_memory_mb:.1f}MB)"
+        )
+        logger.info(f"推荐理由: {recommendation.reason}")
+
+        # 构建索引参数
+        index_params = {
+            "metric_type": recommendation.metric_type,
+            "index_type": recommendation.index_type,
+            "params": recommendation.params,
+        }
+
+        logger.info(f"索引参数: {index_params}")
+
+        try:
+            _ = self._collection.create_index(
+                field_name="vector",
+                index_params=index_params,
+            )
+            logger.info(f"成功创建 {recommendation.index_type} 索引")
+        except Exception as e:
+            logger.error(f"创建索引失败: {e}")
+            # 回退到IVF_FLAT
+            logger.warning("回退到默认 IVF_FLAT 索引")
+            fallback_params = {
+                "metric_type": "L2",
+                "index_type": "IVF_FLAT",
+                "params": {"nlist": 128},
+            }
+            _ = self._collection.create_index(
+                field_name="vector",
+                index_params=fallback_params,
+            )
+            logger.info("成功创建回退索引")
 
     def _load_collection(self) -> None:
         """加载 collection 到内存"""
@@ -251,6 +293,50 @@ class MilvusClientManager:
         if self._collection is None:
             raise RuntimeError("Collection 未初始化，请先调用 connect()")
         return self._collection
+
+    def get_optimal_search_params(self) -> dict:
+        """获取当前索引的最优搜索参数
+
+        Returns:
+            dict: 搜索参数字典，用于similarity_search
+
+        示例:
+            search_params = milvus_manager.get_optimal_search_params()
+            results = collection.search(
+                data=[query_vector],
+                anns_field="vector",
+                param=search_params,
+                limit=10
+            )
+        """
+        if self._collection is None:
+            raise RuntimeError("Collection 未初始化")
+
+        try:
+            # 获取collection的索引信息
+            vector_count = self._collection.num_entities
+
+            # 获取索引推荐
+            recommendation = index_strategy_selector.select_index(
+                vector_count=max(vector_count, 1000),
+                preferred_index_type=config.milvus_index_type,
+                metric_type=config.milvus_metric_type,  # type: ignore[arg-type]
+            )
+
+            # 获取搜索参数
+            search_params = index_strategy_selector.get_search_params(recommendation)
+
+            logger.debug(
+                f"查询参数优化: 索引={recommendation.index_type}, "
+                f"参数={search_params}"
+            )
+
+            return search_params
+
+        except Exception as e:
+            logger.warning(f"获取搜索参数失败: {e}，使用默认参数")
+            # 返回默认参数
+            return {"nprobe": 16}
 
     def health_check(self) -> bool:
         """
