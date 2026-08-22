@@ -1,14 +1,19 @@
-"""腾讯云 CLS (Cloud Log Service) MCP Server
+"""Log MCP Server.
 
-本地实现的 CLS 日志服务 MCP Server，提供日志查询、检索和分析功能。
+The server keeps the original CLS-like tools for compatibility, and adds a
+provider-backed service log search tool for containerized Spring Boot services.
+Set AIOPS_LOG_PROVIDER=elasticsearch to query real logs from Elasticsearch.
 """
 
 import logging
 import functools
 import json
+import os
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from fastmcp import FastMCP
+
+from providers import get_log_provider
 
 # 配置日志
 logging.basicConfig(
@@ -99,6 +104,18 @@ def generate_time_series(base_time: datetime, minutes_offset: int) -> str:
     """
     result_time = base_time + timedelta(minutes=minutes_offset)
     return result_time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _default_service_name() -> str:
+    return os.getenv("AIOPS_DEFAULT_SERVICE_NAME", "data-sync-service")
+
+
+def _default_env() -> Optional[str]:
+    return os.getenv("AIOPS_DEFAULT_ENV") or None
+
+
+def _timestamp_ms_to_iso(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000).isoformat()
 
 
 @mcp.tool()
@@ -279,25 +296,28 @@ def search_topic_by_service_name(
             end_time=current_ts
         )
     """
-    # Mock 主题数据（实际应该从配置或数据库读取）
+    default_service = _default_service_name()
+    provider_type = os.getenv("AIOPS_LOG_PROVIDER", "mock")
+
+    # 主题仍作为兼容层存在。真实查询时，topic_id 可以映射到 service_name。
     mock_topics = [
         {
             "topic_id": "topic-001",
             "topic_name": "数据同步服务日志",
-            "service_name": "data-sync-service",
+            "service_name": default_service,
             "region_code": "ap-beijing",
             "create_time": "2024-01-01 10:00:00",
             "log_count": 0,
-            "description": "数据同步服务的应用日志，包含同步任务执行情况"
+            "description": f"{default_service} application logs ({provider_type} provider)"
         },
         {
             "topic_id": "topic-002",
             "topic_name": "数据同步服务错误日志",
-            "service_name": "data-sync-service",
+            "service_name": default_service,
             "region_code": "ap-beijing",
             "create_time": "2024-01-01 10:00:00",
             "log_count": 0,
-            "description": "数据同步服务的错误日志"
+            "description": f"{default_service} error logs ({provider_type} provider)"
         },
         {
             "topic_id": "topic-003",
@@ -341,6 +361,63 @@ def search_topic_by_service_name(
         },
         "message": f"找到 {len(matched_topics)} 个匹配的日志主题" if matched_topics else f"未找到服务 '{service_name}' 的日志主题"
     }
+
+
+@mcp.tool()
+@log_tool_call
+def search_service_logs(
+    service_name: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    keyword: Optional[str] = None,
+    level: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    path: Optional[str] = None,
+    status: Optional[int] = None,
+    min_duration_ms: Optional[int] = None,
+    env: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Search containerized Spring Boot service logs.
+
+    Use this tool for AIOps diagnosis when the target backend service writes
+    structured JSON logs to Elasticsearch. It supports filtering by service,
+    time range, keyword, level, trace/request id, HTTP path/status, and slow
+    request threshold.
+
+    Args:
+        service_name: Service name, for example "order-service".
+        start_time: Start time. Supports ISO time or "YYYY-MM-DD HH:MM:SS".
+        end_time: End time. Defaults to now when omitted.
+        keyword: Keyword to search in message/exception fields, e.g. "timeout".
+        level: Log level such as INFO, WARN, ERROR.
+        trace_id: Trace id for one request chain.
+        request_id: Request id for one HTTP request.
+        path: HTTP path such as "/api/orders".
+        status: HTTP status code, e.g. 500.
+        min_duration_ms: Return only logs whose duration is greater or equal.
+        env: Environment tag, e.g. prod/test/dev.
+        limit: Max logs to return, capped by provider.
+
+    Returns:
+        Dict with normalized log entries and query metadata.
+    """
+    provider = get_log_provider()
+    return provider.search_logs(
+        service_name=service_name,
+        start_time=start_time,
+        end_time=end_time,
+        keyword=keyword,
+        level=level,
+        trace_id=trace_id,
+        request_id=request_id,
+        path=path,
+        status=status,
+        min_duration_ms=min_duration_ms,
+        env=env or _default_env(),
+        limit=limit,
+    )
 
 
 @mcp.tool()
@@ -408,49 +485,13 @@ def search_log(
             limit=100
         )
     """
-    # 根据 topic_id 返回不同的结果
-    if topic_id == "topic-001":
-        # topic-001: 应用日志，动态生成 INFO 日志
-        logs = []
-        current_time_ms = start_time
-        count = 0
-
-        # 计算最大可生成的日志条数（基于时间范围）
-        max_logs_by_time = int((end_time - start_time) / (60 * 1000)) + 1
-
-        # 实际生成的日志数量取 limit 和时间范围内最大日志数的较小值
-        actual_limit = min(limit, max_logs_by_time)
-
-        while current_time_ms <= end_time and count < actual_limit:
-            # 将毫秒时间戳转换为可读格式
-            log_time = datetime.fromtimestamp(current_time_ms / 1000)
-            time_str = log_time.strftime("%Y-%m-%d %H:%M:%S")
-
-            log_entry = {
-                "timestamp": time_str,
-                "level": "INFO",
-                "message": "正在同步元数据……"
-            }
-
-            logs.append(log_entry)
-            count += 1
-
-            # 下一条日志时间增加1分钟（60秒 * 1000毫秒）
-            current_time_ms += 60 * 1000
-
-        return {
-            "topic_id": topic_id,
-            "start_time": start_time,
-            "end_time": end_time,
-            "query": query,
-            "limit": limit,
-            "total": len(logs),
-            "logs": logs,
-            "took_ms": 50,
-            "message": f"成功查询 {len(logs)} 条应用日志"
-        }
-    else:
-        # 其他 topic_id: 返回错误，表示 topic 不存在
+    topic_service_map = {
+        "topic-001": _default_service_name(),
+        "topic-002": _default_service_name(),
+        "topic-003": "api-gateway-service",
+    }
+    service_name = topic_service_map.get(topic_id)
+    if not service_name:
         return {
             "topic_id": topic_id,
             "start_time": start_time,
@@ -461,8 +502,31 @@ def search_log(
             "logs": [],
             "took_ms": 0,
             "error": f"主题不存在: {topic_id}",
-            "message": f"错误: 未找到主题 {topic_id}，请检查 topic_id 是否正确"
+            "message": f"错误: 未找到主题 {topic_id}，请检查 topic_id 是否正确",
         }
+
+    keyword = query
+    level = None
+    if query:
+        normalized = query.strip()
+        if normalized.lower().startswith("level:"):
+            level = normalized.split(":", 1)[1].strip().upper()
+            keyword = None
+        elif normalized.lower().startswith("message:"):
+            keyword = normalized.split(":", 1)[1].strip()
+
+    result = search_service_logs(
+        service_name=service_name,
+        start_time=_timestamp_ms_to_iso(start_time),
+        end_time=_timestamp_ms_to_iso(end_time),
+        keyword=keyword,
+        level=level,
+        limit=limit,
+    )
+    result["topic_id"] = topic_id
+    result["query"] = query
+    result["message"] = f"成功查询 {result.get('total', 0)} 条日志"
+    return result
 
 
 
