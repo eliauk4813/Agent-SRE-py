@@ -4,6 +4,7 @@
 支持真正的流式输出和更好的模型适配。
 """
 
+from textwrap import dedent
 from typing import Annotated, Any, AsyncGenerator, Dict, Sequence
 
 from langchain.agents import create_agent
@@ -150,7 +151,6 @@ class RagAgentService:
         Returns:
             str: 系统提示词
         """
-        from textwrap import dedent
 
         return dedent("""
             你是一个专业的AI助手，能够使用多种工具来帮助用户解决问题。
@@ -186,6 +186,71 @@ class RagAgentService:
             SystemMessage(content=system_prompt),
             HumanMessage(content=question),
         ]
+
+    async def _refresh_summary_if_needed(self, session_id: str) -> None:
+        """Update rolling summary when enough new messages are accumulated."""
+        if not conversation_memory_service.should_update_summary(
+            session_id=session_id,
+            threshold_messages=config.chat_memory_summary_trigger_messages,
+        ):
+            return
+
+        messages = conversation_memory_service.get_messages_for_summary(session_id)
+        if not messages:
+            return
+
+        existing_summary = conversation_memory_service.get_summary(session_id)
+        transcript_lines = []
+        for message in messages:
+            role = "用户" if message.get("role") == "user" else "助手"
+            content = str(message.get("content", "")).strip()
+            if content:
+                transcript_lines.append(f"{role}: {content}")
+
+        if not transcript_lines:
+            return
+
+        summary_prompt = dedent("""
+            请更新这段会话的结构化摘要。摘要用于后续多轮对话的上下文恢复，
+            必须保留稳定事实、用户目标、项目背景、重要技术结论和用户偏好。
+
+            输出要求：
+            - 使用中文 Markdown
+            - 简洁但信息完整
+            - 不要编造未出现的信息
+            - 保留已有摘要中的仍然有效的信息
+
+            已有摘要：
+            {existing_summary}
+
+            新增对话：
+            {transcript}
+        """).strip()
+
+        try:
+            llm = ChatQwen(
+                model=config.rag_query_rewrite_model,
+                api_key=config.dashscope_api_key,
+                temperature=0,
+            )
+            response = await llm.ainvoke(
+                summary_prompt.format(
+                    existing_summary=existing_summary or "无",
+                    transcript="\n".join(transcript_lines),
+                )
+            )
+            summary = response.content if hasattr(response, "content") else str(response)
+            covered_message_id = int(messages[-1]["id"])
+            conversation_memory_service.update_summary(
+                session_id=session_id,
+                summary=summary,
+                covered_message_id=covered_message_id,
+            )
+            logger.info(
+                f"[会话 {session_id}] 会话摘要已更新，覆盖到消息 {covered_message_id}"
+            )
+        except Exception as exc:
+            logger.warning(f"[会话 {session_id}] 更新会话摘要失败: {exc}")
 
     async def query(
         self,
@@ -243,6 +308,7 @@ class RagAgentService:
                     assistant_content=answer,
                     metadata={"mode": "normal"},
                 )
+                await self._refresh_summary_if_needed(session_id)
                 return answer
 
             logger.warning(f"[会话 {session_id}] Agent 返回结果为空")
@@ -321,6 +387,7 @@ class RagAgentService:
                     assistant_content=full_answer,
                     metadata={"mode": "stream"},
                 )
+                await self._refresh_summary_if_needed(session_id)
             yield {"type": "complete"}
 
         except Exception as e:
