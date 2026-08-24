@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     chat_memory_db_path: str = "./data/chat_memory.db"
     chat_memory_recent_turns: int = 4
     chat_memory_summary_trigger_messages: int = 12
+    chat_memory_long_term_enabled: bool = True
+    chat_memory_long_term_top_k: int = 5
 
     mcp_cls_transport: str = "streamable-http"
     mcp_cls_url: str = "http://localhost:8003/mcp"
