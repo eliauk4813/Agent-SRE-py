@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     md_chunk_min_size: int = 200
     md_use_semantic_chunking: bool = True  # 是否启用语义切分
 
+    chat_memory_db_path: str = "./data/chat_memory.db"
+    chat_memory_recent_turns: int = 4
+    chat_memory_summary_trigger_messages: int = 12
+
     mcp_cls_transport: str = "streamable-http"
     mcp_cls_url: str = "http://localhost:8003/mcp"
     mcp_monitor_transport: str = "streamable-http"
