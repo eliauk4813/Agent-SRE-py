@@ -15,7 +15,6 @@ from langchain_core.messages import (
     RemoveMessage,
     SystemMessage,
 )
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from loguru import logger
 from typing_extensions import TypedDict
@@ -103,9 +102,6 @@ class RagAgentService:
 
         # MCP 客户端（延迟初始化，使用全局管理）
         self.mcp_tools: list = []
-
-        # 创建内存检查点（用于会话管理）
-        self.checkpointer = MemorySaver()
 
         # Agent 初始化（会在异步方法中完成）
         self.agent = None
