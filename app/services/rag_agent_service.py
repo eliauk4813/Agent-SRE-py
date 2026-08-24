@@ -4,6 +4,7 @@
 支持真正的流式输出和更好的模型适配。
 """
 
+import json
 from textwrap import dedent
 from typing import Annotated, Any, AsyncGenerator, Dict, Sequence
 
@@ -24,6 +25,7 @@ from app.config import config
 from app.tools import get_current_time, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
 from app.services.conversation_memory_service import conversation_memory_service
+from app.services.long_term_memory_service import long_term_memory_service
 
 # 阿里千问大模型和langchain集成参考： https://docs.langchain.com/oss/python/integrations/chat/qwen
 # 注意：需要配置环境变量 DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1 否则默认访问的是新加坡站点
@@ -177,15 +179,98 @@ class RagAgentService:
             recent_turns=config.chat_memory_recent_turns,
         )
         memory_text = memory_context.to_prompt_text()
+        long_term_text = ""
+        if config.chat_memory_long_term_enabled:
+            memories = long_term_memory_service.retrieve(
+                query=question,
+                top_k=config.chat_memory_long_term_top_k,
+            )
+            long_term_text = long_term_memory_service.format_for_prompt(memories)
 
         system_prompt = self.system_prompt
         if memory_text:
             system_prompt = f"{system_prompt}\n\n# 会话记忆\n{memory_text}"
+        if long_term_text:
+            system_prompt = f"{system_prompt}\n\n# 长期记忆\n{long_term_text}"
 
         return [
             SystemMessage(content=system_prompt),
             HumanMessage(content=question),
         ]
+
+    async def _extract_long_term_memories(
+        self,
+        session_id: str,
+        question: str,
+        answer: str,
+    ) -> None:
+        """Extract durable memories from one completed turn."""
+        if not config.chat_memory_long_term_enabled:
+            return
+
+        extraction_prompt = dedent("""
+            请从本轮对话中抽取值得长期保存的记忆。
+
+            只保存稳定、之后可能复用的信息，例如：
+            - 用户偏好：表达风格、输出格式、严谨性要求
+            - 项目事实：技术栈、部署方式、数据源、组件边界
+            - 技术决策：已经确认的设计方案或实现约束
+            - 简历表述：已经确认应该如何描述或避免夸大的点
+
+            不要保存临时寒暄、一次性问题、模型推测或不确定内容。
+
+            请只输出 JSON 数组，数组元素格式：
+            {{
+              "type": "user_preference|project_fact|technical_decision|resume_claim|constraint",
+              "content": "一条完整、可独立理解的记忆",
+              "importance": 0.0 到 1.0
+            }}
+
+            如果没有值得保存的内容，输出 []。
+
+            用户问题：
+            {question}
+
+            助手回答：
+            {answer}
+        """).strip()
+
+        try:
+            llm = ChatQwen(
+                model=config.rag_query_rewrite_model,
+                api_key=config.dashscope_api_key,
+                temperature=0,
+            )
+            response = await llm.ainvoke(
+                extraction_prompt.format(question=question, answer=answer[:4000])
+            )
+            raw_content = response.content if hasattr(response, "content") else str(response)
+            memories = self._parse_memory_items(raw_content)
+            if memories:
+                long_term_memory_service.add_memories(memories, session_id=session_id)
+        except Exception as exc:
+            logger.warning(f"[会话 {session_id}] 抽取长期记忆失败: {exc}")
+
+    def _parse_memory_items(self, content: str) -> list[dict[str, Any]]:
+        """Parse JSON memory extraction output from the LLM."""
+        text = content.strip()
+        if not text:
+            return []
+
+        if "```json" in text:
+            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in text:
+            text = text.split("```", 1)[1].split("```", 1)[0].strip()
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug(f"长期记忆 JSON 解析失败: {content[:200]}")
+            return []
+
+        if not isinstance(parsed, list):
+            return []
+        return [item for item in parsed if isinstance(item, dict)]
 
     async def _refresh_summary_if_needed(self, session_id: str) -> None:
         """Update rolling summary when enough new messages are accumulated."""
@@ -308,6 +393,7 @@ class RagAgentService:
                     assistant_content=answer,
                     metadata={"mode": "normal"},
                 )
+                await self._extract_long_term_memories(session_id, question, answer)
                 await self._refresh_summary_if_needed(session_id)
                 return answer
 
@@ -387,6 +473,7 @@ class RagAgentService:
                     assistant_content=full_answer,
                     metadata={"mode": "stream"},
                 )
+                await self._extract_long_term_memories(session_id, question, full_answer)
                 await self._refresh_summary_if_needed(session_id)
             yield {"type": "complete"}
 
