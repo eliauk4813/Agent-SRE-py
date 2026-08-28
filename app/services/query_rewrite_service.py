@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from textwrap import dedent
-from typing import Iterable, List
+from typing import List
 
 from loguru import logger
-from pydantic import BaseModel, Field
 
 from app.config import config
 
@@ -24,16 +22,8 @@ class QueryRewriteResult:
     reasons: List[str] = field(default_factory=list)
 
 
-class LLMRewriteOutput(BaseModel):
-    """Structured output expected from the rewrite model."""
-
-    queries: List[str] = Field(
-        description="Retrieval-oriented rewritten queries. Do not include explanations."
-    )
-
-
 class QueryRewriteService:
-    """Rewrite user questions into retrieval-friendly queries."""
+    """Rewrite user questions into one retrieval-friendly enhanced query."""
 
     _ERROR_CODE_PATTERN = re.compile(r"\b(?:[1-5]\d{2}|OOMKilled|CrashLoopBackOff|ErrImagePull)\b", re.I)
     _LATENCY_PATTERN = re.compile(
@@ -61,9 +51,12 @@ class QueryRewriteService:
         r"\u5904\u7406|\u6062\u590d)",
         re.I,
     )
+    _SERVICE_ENTITY_PATTERN = re.compile(
+        r"\b[a-zA-Z][a-zA-Z0-9_-]*(?:-service|-api|-gateway|-worker|-job|service|api|gateway)\b"
+    )
 
     def rewrite(self, query: str) -> QueryRewriteResult:
-        """Return original query plus optional rewritten variants."""
+        """Return a single normalized or entity-enhanced query."""
         normalized_query = self._normalize_query(query)
         if not normalized_query:
             return QueryRewriteResult(
@@ -94,17 +87,9 @@ class QueryRewriteService:
             )
 
         strategy = config.rag_query_rewrite_strategy.strip().lower()
-        rewritten_queries = self._rewrite_by_rules(normalized_query)
-
-        if strategy in {"llm", "hybrid"}:
-            rewritten_queries.extend(self._rewrite_by_llm(normalized_query, reasons))
-
-        queries = self._deduplicate_queries(
-            [normalized_query, *rewritten_queries],
-            max_queries=config.rag_query_rewrite_max_queries,
-        )
-
-        rewrite_applied = len(queries) > 1
+        enhanced_query = self._rewrite_by_entity_enhancement(normalized_query, reasons)
+        queries = [enhanced_query]
+        rewrite_applied = enhanced_query != normalized_query
         logger.info(
             "Query rewrite complete: "
             f"strategy={strategy}, applied={rewrite_applied}, "
@@ -145,80 +130,44 @@ class QueryRewriteService:
             return False, reasons
         return True, reasons
 
-    def _rewrite_by_rules(self, query: str) -> List[str]:
-        variants: List[str] = []
+    def _rewrite_by_entity_enhancement(self, query: str, reasons: List[str]) -> str:
+        terms = self._extract_enrichment_terms(query, reasons)
+        if not terms:
+            return query
+        return self._normalize_query(f"{query} {' '.join(terms)}")
 
-        if self._ERROR_PATTERN.search(query):
-            variants.append(f"{query} common causes troubleshooting solution")
-            variants.append(f"{query} upstream service gateway timeout logs")
+    def _extract_enrichment_terms(self, query: str, reasons: List[str]) -> List[str]:
+        terms: List[str] = []
 
-        if self._LATENCY_PATTERN.search(query):
-            variants.append(f"{query} performance bottleneck slow query resource usage")
+        if "contains_error_code" in reasons or "contains_error_signal" in reasons:
+            terms.extend(["error", "exception", "troubleshooting", "root cause"])
 
-        if self._LOG_PATTERN.search(query):
-            variants.append(f"{query} logs trace alerts metrics correlation analysis")
+        if "contains_latency_signal" in reasons:
+            terms.extend(["latency", "timeout", "performance", "bottleneck"])
 
-        if self._OPS_PATTERN.search(query):
-            variants.append(f"{query} sre incident diagnosis root cause recovery steps")
+        if "contains_observability_signal" in reasons:
+            terms.extend(["logs", "trace", "metrics", "alerts"])
 
-        return variants
+        if "contains_ops_entity" in reasons:
+            terms.extend(["sre", "incident", "diagnosis", "recovery"])
 
-    def _rewrite_by_llm(self, query: str, reasons: Iterable[str]) -> List[str]:
-        if not config.dashscope_api_key:
-            logger.info("Skip LLM query rewrite: dashscope_api_key is empty")
-            return []
+        service_entities = self._SERVICE_ENTITY_PATTERN.findall(query)
+        terms.extend(service_entities)
 
-        try:
-            from langchain_core.prompts import ChatPromptTemplate
-            from langchain_qwq import ChatQwen
+        return self._deduplicate_terms(terms, query)
 
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    (
-                        "system",
-                        dedent(
-                            """
-                            You are a retrieval query rewriter.
-                            Rewrite the user's question into search-friendly queries.
-                            Requirements:
-                            - Preserve the original intent and do not introduce conclusions.
-                            - Output 1 to 3 queries.
-                            - Cover symptoms, key entities, error codes, logs, metrics, and diagnosis actions.
-                            - Do not output explanations.
-                            """
-                        ).strip(),
-                    ),
-                    (
-                        "user",
-                        "User question: {query}\nRewrite signals: {reasons}\nGenerate retrieval queries.",
-                    ),
-                ]
-            )
-            llm = ChatQwen(
-                model=config.rag_query_rewrite_model,
-                api_key=config.dashscope_api_key,
-                temperature=config.rag_query_rewrite_temperature,
-            )
-            chain = prompt | llm.with_structured_output(LLMRewriteOutput)
-            result = chain.invoke({"query": query, "reasons": ", ".join(reasons)})
-            return [self._normalize_query(item) for item in result.queries if item.strip()]
-        except Exception as exc:
-            logger.warning(f"LLM query rewrite failed, fallback to rule rewrite: {exc}")
-            return []
-
-    def _deduplicate_queries(self, queries: Iterable[str], max_queries: int) -> List[str]:
+    def _deduplicate_terms(self, terms: List[str], query: str) -> List[str]:
+        query_lower = query.lower()
         seen: set[str] = set()
         deduplicated: List[str] = []
 
-        for query in queries:
-            normalized = self._normalize_query(query)
+        for term in terms:
+            normalized = self._normalize_query(term)
             key = normalized.lower()
-            if not normalized or key in seen:
+            if not normalized or key in seen or key in query_lower:
                 continue
             seen.add(key)
             deduplicated.append(normalized)
-            if len(deduplicated) >= max(1, max_queries):
-                break
 
         return deduplicated
 

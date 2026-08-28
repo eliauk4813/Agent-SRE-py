@@ -41,9 +41,9 @@ class Settings(BaseSettings):
     rag_es_weight: float = 1.0
     rag_model: str = "qwen-max"
     rag_query_rewrite_enabled: bool = True
-    rag_query_rewrite_strategy: str = "rules"
+    rag_query_rewrite_strategy: str = "entity_enhanced"
     rag_query_rewrite_model: str = "qwen-plus"
-    rag_query_rewrite_max_queries: int = 4
+    rag_query_rewrite_max_queries: int = 1
     rag_query_rewrite_temperature: float = 0.0
 
     es_url: str = "http://localhost:9200"
